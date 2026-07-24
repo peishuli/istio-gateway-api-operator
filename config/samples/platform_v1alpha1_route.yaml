@@ -1,0 +1,11 @@
+apiVersion: istio-gateway-api-operator.io/v1alpha1
+kind: Route
+metadata:
+  name: nginx
+  namespace: default
+spec:
+  rules:
+    - host: nginx.newrezk8snonprod.com
+      backend:
+        serviceName: nginx
+        servicePort: 80

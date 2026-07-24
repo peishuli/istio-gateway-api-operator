@@ -1,0 +1,218 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: routes.istio-gateway-api-operator.io
+spec:
+  group: istio-gateway-api-operator.io
+  names:
+    kind: Route
+    listKind: RouteList
+    plural: routes
+    singular: route
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: Ready
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Synced')].status
+      name: Synced
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Route is the Schema for the routes API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: RouteSpec defines the desired state of Route.
+            properties:
+              cors:
+                description: CORS is the CORS policy applied to all rules. Omit to
+                  disable CORS.
+                properties:
+                  allowHeaders:
+                    description: AllowHeaders is a list of allowed request headers.
+                    items:
+                      type: string
+                    type: array
+                  allowMethods:
+                    description: AllowMethods is a list of allowed HTTP methods.
+                    items:
+                      type: string
+                    type: array
+                  allowOrigins:
+                    description: AllowOrigins is a list of regex patterns for allowed
+                      origins.
+                    items:
+                      type: string
+                    type: array
+                  maxAge:
+                    default: 24h
+                    description: MaxAge is how long preflight results can be cached.
+                    type: string
+                type: object
+              gateway:
+                description: Gateway is a custom gateway reference. Defaults to istio-gateway
+                  in istio-system.
+                properties:
+                  name:
+                    default: istio-gateway
+                    description: Name is the Gateway resource name.
+                    type: string
+                  namespace:
+                    default: istio-system
+                    description: Namespace is the Gateway resource namespace.
+                    type: string
+                type: object
+              maxBodySize:
+                description: MaxBodySize is the max request body in bytes (e.g., 734003200
+                  for 700MB). Applied to all rules.
+                type: string
+              rules:
+                description: Rules is a list of routing rules. Each rule maps a host+path
+                  to a backend service.
+                items:
+                  description: RouteRule defines a single routing rule mapping a host+path
+                    to a backend.
+                  properties:
+                    backend:
+                      description: Backend defines the target service.
+                      properties:
+                        protocol:
+                          default: HTTP
+                          description: Protocol is the protocol the backend expects.
+                            HTTPS triggers a DestinationRule.
+                          enum:
+                          - HTTP
+                          - HTTPS
+                          type: string
+                        serviceName:
+                          description: ServiceName is the target Kubernetes Service
+                            name.
+                          type: string
+                        servicePort:
+                          description: ServicePort is the target Service port number.
+                          format: int32
+                          type: integer
+                      required:
+                      - serviceName
+                      - servicePort
+                      type: object
+                    host:
+                      description: Host is the hostname to route (e.g., app.example.com).
+                      type: string
+                    path:
+                      default: /
+                      description: Path is the path prefix to match.
+                      type: string
+                  required:
+                  - backend
+                  - host
+                  type: object
+                minItems: 1
+                type: array
+              sslRedirect:
+                default: true
+                description: SSLRedirect enables per-host HTTP→HTTPS redirect HTTPRoutes.
+                type: boolean
+              timeout:
+                description: Timeout is the request timeout (e.g., 60s, 300s). Applied
+                  to all rules.
+                type: string
+            required:
+            - rules
+            type: object
+          status:
+            description: RouteStatus defines the observed state of Route.
+            properties:
+              conditions:
+                description: Conditions represent the latest available observations
+                  of the Route's state.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              managedResources:
+                description: ManagedResources is the count of resources managed by
+                  this Route.
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
