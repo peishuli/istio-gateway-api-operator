@@ -172,6 +172,31 @@ type RouteCanary struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=99
 	Weight int32 `json:"weight"`
+
+	// RollbackOn5xx enables automatic rollback to stable-only when canary 5xx breaches threshold.
+	// +optional
+	RollbackOn5xx *RouteCanaryRollback `json:"rollbackOn5xx,omitempty"`
+}
+
+// RouteCanaryRollback defines automatic rollback behavior based on canary probe 5xx responses.
+type RouteCanaryRollback struct {
+	// FiveXXThreshold is the number of consecutive canary probe 5xx responses needed to trigger rollback.
+	// +kubebuilder:validation:Minimum=1
+	FiveXXThreshold int32 `json:"fiveXXThreshold"`
+
+	// ProbePath is the HTTP path probed on the canary backend.
+	// +optional
+	ProbePath string `json:"probePath,omitempty"`
+
+	// IntervalSeconds is the probe interval for canary health checks.
+	// +kubebuilder:validation:Minimum=5
+	// +optional
+	IntervalSeconds *int32 `json:"intervalSeconds,omitempty"`
+
+	// CooldownSeconds keeps canary disabled after rollback before re-enabling probes.
+	// +kubebuilder:validation:Minimum=10
+	// +optional
+	CooldownSeconds *int32 `json:"cooldownSeconds,omitempty"`
 }
 
 // RouteSpec defines the desired state of Route.

@@ -19,9 +19,12 @@ package controller
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -53,6 +56,8 @@ const (
 	routeNameLabel = "istio-gateway-api-operator.io/route-name"
 	requeueDelay   = 15 * time.Second
 	certWarnBefore = 30 * 24 * time.Hour
+	defaultCanaryProbeInterval = 30 * time.Second
+	defaultCanaryCooldown      = 5 * time.Minute
 )
 
 // RouteReconciler reconciles a Route object
@@ -60,6 +65,10 @@ type RouteReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
+
+	canaryStateMu        sync.Mutex
+	canaryFailureCounts  map[string]int
+	canaryRollbackUntil  map[string]time.Time
 }
 
 // +kubebuilder:rbac:groups=istio-gateway-api-operator.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
@@ -108,6 +117,7 @@ func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 				return ctrl.Result{}, err
 			}
 		}
+		r.clearCanaryRuntimeState(route)
 		clearRouteMetrics(route)
 		outcome = "deleted"
 		return ctrl.Result{}, nil
@@ -193,6 +203,18 @@ func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	route.Status.Phase = platformv1alpha1.RoutePhaseProvisioning
+	effectiveCanary := route.Spec.Canary
+	canaryProbeRequeue := time.Duration(0)
+	if route.Spec.Canary != nil && route.Spec.Canary.RollbackOn5xx != nil {
+		rollbackActive, probeRequeue, err := r.evaluateCanaryRollback(ctx, route)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		canaryProbeRequeue = probeRequeue
+		if rollbackActive {
+			effectiveCanary = nil
+		}
+	}
 
 	// Reconcile child resources
 	managedCount := 0
@@ -200,7 +222,7 @@ func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 	// 1. HTTPRoutes (one per rule)
 	for i, rule := range route.Spec.Rules {
-		if err := r.reconcileHTTPRoute(ctx, route, i, rule); err != nil {
+		if err := r.reconcileHTTPRoute(ctx, route, i, rule, effectiveCanary); err != nil {
 			log.Error(err, "Failed to reconcile HTTPRoute", "index", i)
 			reconcileErr = err
 		} else {
@@ -222,8 +244,8 @@ func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	// 3. VirtualService (if timeout, CORS, retries, or canary split)
-	if route.Spec.Timeout != "" || route.Spec.CORS != nil || route.Spec.Retries != nil || route.Spec.Canary != nil {
-		if err := r.reconcileVirtualService(ctx, route); err != nil {
+	if route.Spec.Timeout != "" || route.Spec.CORS != nil || route.Spec.Retries != nil || effectiveCanary != nil {
+		if err := r.reconcileVirtualService(ctx, route, effectiveCanary); err != nil {
 			log.Error(err, "Failed to reconcile VirtualService")
 			reconcileErr = err
 		} else {
@@ -234,7 +256,7 @@ func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	// 4. DestinationRules (for HTTPS backends)
 	drIndex := 0
 	for _, rule := range route.Spec.Rules {
-		for _, backend := range routeRuleBackends(rule, route.Spec.Canary) {
+		for _, backend := range routeRuleBackends(rule, effectiveCanary) {
 			protocol := backend.Protocol
 			if protocol == "" {
 				protocol = "HTTP"
@@ -332,7 +354,13 @@ func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		outcome = "success"
 	}
 
-	return ctrl.Result{}, reconcileErr
+	if reconcileErr != nil {
+		return ctrl.Result{}, reconcileErr
+	}
+	if canaryProbeRequeue > 0 {
+		return ctrl.Result{RequeueAfter: canaryProbeRequeue}, nil
+	}
+	return ctrl.Result{}, nil
 }
 
 func conditionTransitioned(previous *metav1.Condition, newStatus metav1.ConditionStatus, newReason string) bool {
@@ -572,7 +600,7 @@ func (r *RouteReconciler) gatewayRef(route *platformv1alpha1.Route) (string, str
 	return name, ns
 }
 
-func (r *RouteReconciler) reconcileHTTPRoute(ctx context.Context, route *platformv1alpha1.Route, index int, rule platformv1alpha1.RouteRule) error {
+func (r *RouteReconciler) reconcileHTTPRoute(ctx context.Context, route *platformv1alpha1.Route, index int, rule platformv1alpha1.RouteRule, canary *platformv1alpha1.RouteCanary) error {
 	gwName, gwNs := r.gatewayRef(route)
 	ns := gatewayv1.Namespace(gwNs)
 	sectionName := gatewayv1.SectionName("https")
@@ -591,16 +619,16 @@ func (r *RouteReconciler) reconcileHTTPRoute(ctx context.Context, route *platfor
 		},
 	}}
 
-	if route.Spec.Canary != nil {
-		canaryWeight := route.Spec.Canary.Weight
+	if canary != nil {
+		canaryWeight := canary.Weight
 		primaryWeight := int32(100 - canaryWeight)
 		backendRefs[0].Weight = &primaryWeight
 
-		canaryPort := gatewayv1.PortNumber(route.Spec.Canary.Backend.ServicePort)
+		canaryPort := gatewayv1.PortNumber(canary.Backend.ServicePort)
 		backendRefs = append(backendRefs, gatewayv1.HTTPBackendRef{
 			BackendRef: gatewayv1.BackendRef{
 				BackendObjectReference: gatewayv1.BackendObjectReference{
-					Name: gatewayv1.ObjectName(route.Spec.Canary.Backend.ServiceName),
+					Name: gatewayv1.ObjectName(canary.Backend.ServiceName),
 					Port: &canaryPort,
 				},
 				Weight: &canaryWeight,
@@ -676,7 +704,7 @@ func (r *RouteReconciler) reconcileRedirectHTTPRoute(ctx context.Context, route 
 	return r.createOrUpdate(ctx, route, hr)
 }
 
-func (r *RouteReconciler) reconcileVirtualService(ctx context.Context, route *platformv1alpha1.Route) error {
+func (r *RouteReconciler) reconcileVirtualService(ctx context.Context, route *platformv1alpha1.Route, canary *platformv1alpha1.RouteCanary) error {
 	gwName, gwNs := r.gatewayRef(route)
 
 	// Build HTTP routes
@@ -691,7 +719,7 @@ func (r *RouteReconciler) reconcileVirtualService(ctx context.Context, route *pl
 				Uri:     &istionetv1.StringMatch{MatchType: &istionetv1.StringMatch_Prefix{Prefix: path}},
 				Headers: map[string]*istionetv1.StringMatch{":authority": {MatchType: &istionetv1.StringMatch_Exact{Exact: rule.Host}}},
 			}},
-			Route: buildIstioRouteDestinations(route.Namespace, rule.Backend, route.Spec.Canary),
+			Route: buildIstioRouteDestinations(route.Namespace, rule.Backend, canary),
 		}
 
 		if route.Spec.Timeout != "" {
@@ -798,6 +826,127 @@ func buildIstioRouteDestinations(routeNamespace string, primary platformv1alpha1
 	})
 
 	return dests
+}
+
+func (r *RouteReconciler) evaluateCanaryRollback(ctx context.Context, route *platformv1alpha1.Route) (bool, time.Duration, error) {
+	if route.Spec.Canary == nil || route.Spec.Canary.RollbackOn5xx == nil {
+		return false, 0, nil
+	}
+
+	policy := route.Spec.Canary.RollbackOn5xx
+	probeInterval := defaultCanaryProbeInterval
+	if policy.IntervalSeconds != nil {
+		probeInterval = time.Duration(*policy.IntervalSeconds) * time.Second
+	}
+
+	cooldown := defaultCanaryCooldown
+	if policy.CooldownSeconds != nil {
+		cooldown = time.Duration(*policy.CooldownSeconds) * time.Second
+	}
+
+	key := routeKey(route)
+	now := time.Now()
+	r.canaryStateMu.Lock()
+	if r.canaryFailureCounts == nil {
+		r.canaryFailureCounts = make(map[string]int)
+	}
+	if r.canaryRollbackUntil == nil {
+		r.canaryRollbackUntil = make(map[string]time.Time)
+	}
+	if until, ok := r.canaryRollbackUntil[key]; ok && until.After(now) {
+		r.canaryStateMu.Unlock()
+		return true, probeInterval, nil
+	}
+	r.canaryStateMu.Unlock()
+
+	statusCode, err := r.probeCanaryBackend(ctx, route, route.Spec.Canary.Backend, policy.ProbePath)
+	isFiveXX := err != nil || statusCode >= http.StatusInternalServerError
+
+	triggeredRollback := false
+	recovered := false
+	r.canaryStateMu.Lock()
+	count := r.canaryFailureCounts[key]
+	if isFiveXX {
+		count++
+	} else {
+		count = 0
+	}
+	r.canaryFailureCounts[key] = count
+
+	if count >= int(policy.FiveXXThreshold) {
+		r.canaryRollbackUntil[key] = now.Add(cooldown)
+		r.canaryFailureCounts[key] = 0
+		triggeredRollback = true
+	}
+
+	rollbackActive := false
+	if until, ok := r.canaryRollbackUntil[key]; ok {
+		if until.After(now) {
+			rollbackActive = true
+		} else {
+			delete(r.canaryRollbackUntil, key)
+			recovered = true
+		}
+	}
+	r.canaryStateMu.Unlock()
+
+	if triggeredRollback && r.Recorder != nil {
+		msg := fmt.Sprintf("Canary rollback activated: %d consecutive 5xx probe failures", policy.FiveXXThreshold)
+		r.Recorder.Event(route, corev1.EventTypeWarning, "CanaryRollback", msg)
+	}
+	if recovered && r.Recorder != nil {
+		r.Recorder.Event(route, corev1.EventTypeNormal, "CanaryRecovered", "Canary rollback cooldown elapsed; re-enabling canary traffic")
+	}
+
+	return rollbackActive, probeInterval, nil
+}
+
+func (r *RouteReconciler) probeCanaryBackend(ctx context.Context, route *platformv1alpha1.Route, backend platformv1alpha1.RouteBackend, probePath string) (int, error) {
+	url := canaryBackendProbeURL(route.Namespace, backend, probePath)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	return resp.StatusCode, nil
+}
+
+func normalizeCanaryProbePath(path string) string {
+	if path == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		return "/" + path
+	}
+	return path
+}
+
+func canaryBackendProbeURL(namespace string, backend platformv1alpha1.RouteBackend, probePath string) string {
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d%s", backend.ServiceName, namespace, backend.ServicePort, normalizeCanaryProbePath(probePath))
+}
+
+func routeKey(route *platformv1alpha1.Route) string {
+	return route.Namespace + "/" + route.Name
+}
+
+func (r *RouteReconciler) clearCanaryRuntimeState(route *platformv1alpha1.Route) {
+	key := routeKey(route)
+	r.canaryStateMu.Lock()
+	defer r.canaryStateMu.Unlock()
+	if r.canaryFailureCounts != nil {
+		delete(r.canaryFailureCounts, key)
+	}
+	if r.canaryRollbackUntil != nil {
+		delete(r.canaryRollbackUntil, key)
+	}
 }
 
 func buildGatewayHTTPHeaderFilters(headers *platformv1alpha1.RouteHeaders) []gatewayv1.HTTPRouteFilter {

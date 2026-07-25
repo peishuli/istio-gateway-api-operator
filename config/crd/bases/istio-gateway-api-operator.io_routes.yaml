@@ -102,6 +102,35 @@ spec:
                     - serviceName
                     - servicePort
                     type: object
+                  rollbackOn5xx:
+                    description: RollbackOn5xx enables automatic rollback to stable-only
+                      when canary 5xx breaches threshold.
+                    properties:
+                      cooldownSeconds:
+                        description: CooldownSeconds keeps canary disabled after rollback
+                          before re-enabling probes.
+                        format: int32
+                        minimum: 10
+                        type: integer
+                      fiveXXThreshold:
+                        description: FiveXXThreshold is the number of consecutive
+                          canary probe 5xx responses needed to trigger rollback.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      intervalSeconds:
+                        description: IntervalSeconds is the probe interval for canary
+                          health checks.
+                        format: int32
+                        minimum: 5
+                        type: integer
+                      probePath:
+                        description: ProbePath is the HTTP path probed on the canary
+                          backend.
+                        type: string
+                    required:
+                    - fiveXXThreshold
+                    type: object
                   weight:
                     description: |-
                       Weight is the percentage of traffic sent to canary backend.
