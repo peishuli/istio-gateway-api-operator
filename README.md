@@ -247,7 +247,7 @@ This project is technically a **controller** — it watches a CRD and reconciles
 
 ## Roadmap
 
-- [ ] **Admission Webhooks** — Validating webhook to reject Routes where `host` doesn't match the Gateway's hostname pattern; mutating webhook to auto-inject gateway refs; reject conflicting Routes (same host+path)
+- [x] **Admission Webhooks** — Mutating webhook auto-injects default gateway refs; validating webhook rejects hosts that violate Gateway hostname patterns and rejects conflicting Routes (same gateway+host+path).
 - [x] **Multi-phase Status** — `status.phase` state machine implemented (`Pending`/`Provisioning`/`Active`/`Degraded`). Reconciliation now gates on backend readiness before generating managed resources.
 - [x] **Backend Health Awareness** — Controller detects missing Service or zero-endpoint backends, sets status phase/conditions accordingly, emits warning events, and requeues for automatic recovery.
 - [x] **Runtime Route Conflict Guard** — Controller detects gateway+host+path conflicts and marks one side `Degraded` with reason `RouteConflict` while allowing the selected winner to reconcile.

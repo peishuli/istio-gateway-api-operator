@@ -3,7 +3,7 @@ package controller
 import (
 	"testing"
 
-	platformv1alpha1 "github.com/istio-gateway-api-operator/route-operator/api/v1alpha1"
+	platformv1alpha1 "github.com/istio-gateway-operator/route-operator/api/v1alpha1"
 )
 
 func TestNormalizeCanaryProbePath(t *testing.T) {

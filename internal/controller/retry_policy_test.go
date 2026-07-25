@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	platformv1alpha1 "github.com/istio-gateway-api-operator/route-operator/api/v1alpha1"
+	platformv1alpha1 "github.com/istio-gateway-operator/route-operator/api/v1alpha1"
 )
 
 func TestBuildIstioHTTPRetryNil(t *testing.T) {

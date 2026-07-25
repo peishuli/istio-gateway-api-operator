@@ -46,7 +46,7 @@ import (
 	istiotypev1beta1 "istio.io/api/type/v1beta1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	platformv1alpha1 "github.com/istio-gateway-api-operator/route-operator/api/v1alpha1"
+	platformv1alpha1 "github.com/istio-gateway-operator/route-operator/api/v1alpha1"
 	securityv1beta1 "istio.io/client-go/pkg/apis/security/v1beta1"
 )
 

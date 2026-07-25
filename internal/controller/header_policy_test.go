@@ -6,7 +6,7 @@ import (
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	platformv1alpha1 "github.com/istio-gateway-api-operator/route-operator/api/v1alpha1"
+	platformv1alpha1 "github.com/istio-gateway-operator/route-operator/api/v1alpha1"
 )
 
 func TestBuildGatewayHTTPHeaderFiltersNil(t *testing.T) {

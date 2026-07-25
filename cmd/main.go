@@ -42,8 +42,8 @@ import (
 	securityv1beta1 "istio.io/client-go/pkg/apis/security/v1beta1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	platformv1alpha1 "github.com/istio-gateway-api-operator/route-operator/api/v1alpha1"
-	"github.com/istio-gateway-api-operator/route-operator/internal/controller"
+	platformv1alpha1 "github.com/istio-gateway-operator/route-operator/api/v1alpha1"
+	"github.com/istio-gateway-operator/route-operator/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -217,6 +217,10 @@ func main() {
 		Recorder: mgr.GetEventRecorderFor("route-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Route")
+		os.Exit(1)
+	}
+	if err := platformv1alpha1.SetupRouteWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "Route")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
