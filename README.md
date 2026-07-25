@@ -253,7 +253,7 @@ This project is technically a **controller** — it watches a CRD and reconciles
 - [x] **Runtime Route Conflict Guard** — Controller detects gateway+host+path conflicts and marks one side `Degraded` with reason `RouteConflict` while allowing the selected winner to reconcile.
 - [x] **Certificate Expiry Tracking** — Controller inspects Gateway HTTPS TLS `certificateRefs` secrets and reports `CertificateHealthy` condition (`CertificateHealthy`, `CertificateExpiring`, `CertificateExpired`, `CertificateSecretMissing`, etc.).
 - [x] **Custom Prometheus Metrics** — `route_reconcile_total`, `route_status_phase`, `route_backend_health`, `route_managed_resources` exported by controller-runtime metrics endpoint.
-- [ ] **Rate Limiting** — `spec.rateLimit` field to auto-generate Istio EnvoyFilter with local/global rate limiting
+- [x] **Rate Limiting** — `spec.rateLimit` now auto-generates Istio EnvoyFilter local token-bucket rate limiting (requests per unit with optional burst) for route hosts.
 - [ ] **Canary / Traffic Splitting** — `spec.canary` field with weight-based splitting between two backends, automated rollback on 5xx threshold
 - [x] **Retry Policy** — `spec.retries` field configures Istio `VirtualService` retry policy (`attempts`, `perTryTimeout`, `retryOn`) across all generated HTTP routes.
 - [x] **Header Manipulation** — `spec.rules[].headers` supports request/response header add/remove/set and is translated into Gateway API header modifier filters plus Istio `VirtualService` header operations.

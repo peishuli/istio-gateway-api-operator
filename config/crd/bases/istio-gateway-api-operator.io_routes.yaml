@@ -117,6 +117,33 @@ spec:
                 description: MaxBodySize is the max request body in bytes (e.g., 734003200
                   for 700MB). Applied to all rules.
                 type: string
+              rateLimit:
+                description: RateLimit configures local token-bucket rate limiting
+                  at the gateway.
+                properties:
+                  burst:
+                    description: Burst is the maximum token bucket size. Defaults
+                      to requestsPerUnit when omitted.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  requestsPerUnit:
+                    description: RequestsPerUnit is the number of allowed requests
+                      for each unit.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  unit:
+                    description: Unit is the replenishment window for RequestsPerUnit.
+                    enum:
+                    - Second
+                    - Minute
+                    - Hour
+                    type: string
+                required:
+                - requestsPerUnit
+                - unit
+                type: object
               retries:
                 description: Retries configures Istio retry policy for all rules.
                 properties:

@@ -146,6 +146,22 @@ type RouteAuth struct {
 	ForwardOriginalToken *bool `json:"forwardOriginalToken,omitempty"`
 }
 
+// RouteRateLimit defines local token-bucket rate limiting for route traffic.
+type RouteRateLimit struct {
+	// RequestsPerUnit is the number of allowed requests for each unit.
+	// +kubebuilder:validation:Minimum=1
+	RequestsPerUnit int32 `json:"requestsPerUnit"`
+
+	// Unit is the replenishment window for RequestsPerUnit.
+	// +kubebuilder:validation:Enum=Second;Minute;Hour
+	Unit string `json:"unit"`
+
+	// Burst is the maximum token bucket size. Defaults to requestsPerUnit when omitted.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	Burst *int32 `json:"burst,omitempty"`
+}
+
 // RouteSpec defines the desired state of Route.
 type RouteSpec struct {
 	// Rules is a list of routing rules. Each rule maps a host+path to a backend service.
@@ -180,6 +196,10 @@ type RouteSpec struct {
 	// Auth configures Istio RequestAuthentication + AuthorizationPolicy resources.
 	// +optional
 	Auth *RouteAuth `json:"auth,omitempty"`
+
+	// RateLimit configures local token-bucket rate limiting at the gateway.
+	// +optional
+	RateLimit *RouteRateLimit `json:"rateLimit,omitempty"`
 }
 
 // RouteConditionType defines the condition types for Route status.

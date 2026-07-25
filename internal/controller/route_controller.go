@@ -282,6 +282,21 @@ func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 
+	// 7. Rate limiting (if enabled)
+	if route.Spec.RateLimit != nil {
+		if err := r.reconcileRateLimitEnvoyFilter(ctx, route); err != nil {
+			log.Error(err, "Failed to reconcile rate limit EnvoyFilter")
+			reconcileErr = err
+		} else {
+			managedCount++
+		}
+	} else {
+		if err := r.deleteRateLimitEnvoyFilter(ctx, route); err != nil {
+			log.Error(err, "Failed to delete rate limit EnvoyFilter")
+			reconcileErr = err
+		}
+	}
+
 	// Update status
 	route.Status.ManagedResources = managedCount
 	if reconcileErr != nil {
@@ -928,6 +943,129 @@ func (r *RouteReconciler) deleteAuthResources(ctx context.Context, route *platfo
 		if err := r.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
 			return err
 		}
+	}
+	return nil
+}
+
+func (r *RouteReconciler) reconcileRateLimitEnvoyFilter(ctx context.Context, route *platformv1alpha1.Route) error {
+	if route.Spec.RateLimit == nil {
+		return nil
+	}
+
+	gwName, gwNs := r.gatewayRef(route)
+	fillInterval, err := rateLimitFillInterval(route.Spec.RateLimit.Unit)
+	if err != nil {
+		return err
+	}
+
+	tokensPerFill := int64(route.Spec.RateLimit.RequestsPerUnit)
+	maxTokens := tokensPerFill
+	if route.Spec.RateLimit.Burst != nil {
+		maxTokens = int64(*route.Spec.RateLimit.Burst)
+	}
+
+	patches := []*istionetv1alpha3.EnvoyFilter_EnvoyConfigObjectPatch{buildRateLimitHTTPFilterPatch(route.Name)}
+	for _, host := range uniqueHostsFromRules(route.Spec.Rules) {
+		patches = append(patches, buildRateLimitRoutePatch(route.Name, host, maxTokens, tokensPerFill, fillInterval))
+	}
+
+	ef := &istiov1alpha3.EnvoyFilter{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-rate-limit", route.Name),
+			Namespace: gwNs,
+			Labels:    r.managedLabels(route),
+		},
+	}
+	ef.Spec.WorkloadSelector = &istionetv1alpha3.WorkloadSelector{
+		Labels: map[string]string{"gateway.networking.k8s.io/gateway-name": gwName},
+	}
+	ef.Spec.ConfigPatches = patches
+
+	return r.createOrUpdateCrossNS(ctx, route, ef)
+}
+
+func buildRateLimitHTTPFilterPatch(routeName string) *istionetv1alpha3.EnvoyFilter_EnvoyConfigObjectPatch {
+	return &istionetv1alpha3.EnvoyFilter_EnvoyConfigObjectPatch{
+		ApplyTo: istionetv1alpha3.EnvoyFilter_HTTP_FILTER,
+		Match: &istionetv1alpha3.EnvoyFilter_EnvoyConfigObjectMatch{
+			Context: istionetv1alpha3.EnvoyFilter_GATEWAY,
+			ObjectTypes: &istionetv1alpha3.EnvoyFilter_EnvoyConfigObjectMatch_Listener{
+				Listener: &istionetv1alpha3.EnvoyFilter_ListenerMatch{
+					FilterChain: &istionetv1alpha3.EnvoyFilter_ListenerMatch_FilterChainMatch{
+						Filter: &istionetv1alpha3.EnvoyFilter_ListenerMatch_FilterMatch{
+							Name: "envoy.filters.network.http_connection_manager",
+							SubFilter: &istionetv1alpha3.EnvoyFilter_ListenerMatch_SubFilterMatch{
+								Name: "envoy.filters.http.router",
+							},
+						},
+					},
+				},
+			},
+		},
+		Patch: &istionetv1alpha3.EnvoyFilter_Patch{
+			Operation: istionetv1alpha3.EnvoyFilter_Patch_INSERT_BEFORE,
+			Value: mustStruct(map[string]any{
+				"name": "envoy.filters.http.local_ratelimit",
+				"typed_config": map[string]any{
+					"@type":       "type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit",
+					"stat_prefix": fmt.Sprintf("%s_local_rate_limiter", routeName),
+				},
+			}),
+		},
+	}
+}
+
+func buildRateLimitRoutePatch(routeName, host string, maxTokens, tokensPerFill int64, fillInterval string) *istionetv1alpha3.EnvoyFilter_EnvoyConfigObjectPatch {
+	statPrefix := strings.NewReplacer(".", "_", "-", "_").Replace(host)
+	return &istionetv1alpha3.EnvoyFilter_EnvoyConfigObjectPatch{
+		ApplyTo: istionetv1alpha3.EnvoyFilter_HTTP_ROUTE,
+		Match: &istionetv1alpha3.EnvoyFilter_EnvoyConfigObjectMatch{
+			Context: istionetv1alpha3.EnvoyFilter_GATEWAY,
+			ObjectTypes: &istionetv1alpha3.EnvoyFilter_EnvoyConfigObjectMatch_RouteConfiguration{
+				RouteConfiguration: &istionetv1alpha3.EnvoyFilter_RouteConfigurationMatch{
+					Vhost: &istionetv1alpha3.EnvoyFilter_RouteConfigurationMatch_VirtualHostMatch{
+						Name: fmt.Sprintf("%s:443", host),
+					},
+				},
+			},
+		},
+		Patch: &istionetv1alpha3.EnvoyFilter_Patch{
+			Operation: istionetv1alpha3.EnvoyFilter_Patch_MERGE,
+			Value: mustStruct(map[string]any{
+				"typed_per_filter_config": map[string]any{
+					"envoy.filters.http.local_ratelimit": map[string]any{
+						"@type":       "type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit",
+						"stat_prefix": fmt.Sprintf("%s_%s", routeName, statPrefix),
+						"token_bucket": map[string]any{
+							"max_tokens":      maxTokens,
+							"tokens_per_fill": tokensPerFill,
+							"fill_interval":   fillInterval,
+						},
+					},
+				},
+			}),
+		},
+	}
+}
+
+func rateLimitFillInterval(unit string) (string, error) {
+	switch unit {
+	case "Second":
+		return "1s", nil
+	case "Minute":
+		return "60s", nil
+	case "Hour":
+		return "3600s", nil
+	default:
+		return "", fmt.Errorf("unsupported rateLimit.unit %q", unit)
+	}
+}
+
+func (r *RouteReconciler) deleteRateLimitEnvoyFilter(ctx context.Context, route *platformv1alpha1.Route) error {
+	_, gwNs := r.gatewayRef(route)
+	ef := &istiov1alpha3.EnvoyFilter{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("%s-rate-limit", route.Name), Namespace: gwNs}}
+	if err := r.Delete(ctx, ef); err != nil && !errors.IsNotFound(err) {
+		return err
 	}
 	return nil
 }
