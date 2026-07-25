@@ -15,6 +15,9 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
     - jsonPath: .status.conditions[?(@.type=='Ready')].status
       name: Ready
       type: string
@@ -91,6 +94,23 @@ spec:
                 description: MaxBodySize is the max request body in bytes (e.g., 734003200
                   for 700MB). Applied to all rules.
                 type: string
+              retries:
+                description: Retries configures Istio retry policy for all rules.
+                properties:
+                  attempts:
+                    description: Attempts is the number of retries for a request.
+                      0 disables retries.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  perTryTimeout:
+                    description: PerTryTimeout is timeout per retry attempt (e.g.,
+                      2s).
+                    type: string
+                  retryOn:
+                    description: RetryOn is a comma-separated list of retry conditions.
+                    type: string
+                type: object
               rules:
                 description: Rules is a list of routing rules. Each rule maps a host+path
                   to a backend service.
@@ -120,6 +140,51 @@ spec:
                       required:
                       - serviceName
                       - servicePort
+                      type: object
+                    headers:
+                      description: Headers applies per-rule request/response header
+                        operations.
+                      properties:
+                        request:
+                          description: Request manipulates request headers before
+                            forwarding.
+                          properties:
+                            add:
+                              additionalProperties:
+                                type: string
+                              description: Add appends values to existing headers.
+                              type: object
+                            remove:
+                              description: Remove deletes headers by name.
+                              items:
+                                type: string
+                              type: array
+                            set:
+                              additionalProperties:
+                                type: string
+                              description: Set overwrites headers with the given values.
+                              type: object
+                          type: object
+                        response:
+                          description: Response manipulates response headers before
+                            returning to clients.
+                          properties:
+                            add:
+                              additionalProperties:
+                                type: string
+                              description: Add appends values to existing headers.
+                              type: object
+                            remove:
+                              description: Remove deletes headers by name.
+                              items:
+                                type: string
+                              type: array
+                            set:
+                              additionalProperties:
+                                type: string
+                              description: Set overwrites headers with the given values.
+                              type: object
+                          type: object
                       type: object
                     host:
                       description: Host is the hostname to route (e.g., app.example.com).
@@ -210,6 +275,14 @@ spec:
                 description: ManagedResources is the count of resources managed by
                   this Route.
                 type: integer
+              phase:
+                description: Phase is the Route lifecycle phase.
+                enum:
+                - Pending
+                - Provisioning
+                - Active
+                - Degraded
+                type: string
             type: object
         type: object
     served: true

@@ -35,6 +35,32 @@ type RouteBackend struct {
 	Protocol string `json:"protocol,omitempty"`
 }
 
+// RouteHeaderOperations defines header add/set/remove operations.
+type RouteHeaderOperations struct {
+	// Set overwrites headers with the given values.
+	// +optional
+	Set map[string]string `json:"set,omitempty"`
+
+	// Add appends values to existing headers.
+	// +optional
+	Add map[string]string `json:"add,omitempty"`
+
+	// Remove deletes headers by name.
+	// +optional
+	Remove []string `json:"remove,omitempty"`
+}
+
+// RouteHeaders defines request/response header manipulation.
+type RouteHeaders struct {
+	// Request manipulates request headers before forwarding.
+	// +optional
+	Request *RouteHeaderOperations `json:"request,omitempty"`
+
+	// Response manipulates response headers before returning to clients.
+	// +optional
+	Response *RouteHeaderOperations `json:"response,omitempty"`
+}
+
 // RouteRule defines a single routing rule mapping a host+path to a backend.
 type RouteRule struct {
 	// Host is the hostname to route (e.g., app.example.com).
@@ -47,6 +73,10 @@ type RouteRule struct {
 
 	// Backend defines the target service.
 	Backend RouteBackend `json:"backend"`
+
+	// Headers applies per-rule request/response header operations.
+	// +optional
+	Headers *RouteHeaders `json:"headers,omitempty"`
 }
 
 // RouteCORS defines the CORS policy applied to all rules.
@@ -82,6 +112,22 @@ type RouteGateway struct {
 	Namespace string `json:"namespace,omitempty"`
 }
 
+// RouteRetries defines Istio HTTP retry policy knobs.
+type RouteRetries struct {
+	// Attempts is the number of retries for a request. 0 disables retries.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Attempts int32 `json:"attempts,omitempty"`
+
+	// PerTryTimeout is timeout per retry attempt (e.g., 2s).
+	// +optional
+	PerTryTimeout string `json:"perTryTimeout,omitempty"`
+
+	// RetryOn is a comma-separated list of retry conditions.
+	// +optional
+	RetryOn string `json:"retryOn,omitempty"`
+}
+
 // RouteSpec defines the desired state of Route.
 type RouteSpec struct {
 	// Rules is a list of routing rules. Each rule maps a host+path to a backend service.
@@ -108,20 +154,43 @@ type RouteSpec struct {
 	// Gateway is a custom gateway reference. Defaults to istio-gateway in istio-system.
 	// +optional
 	Gateway *RouteGateway `json:"gateway,omitempty"`
+
+	// Retries configures Istio retry policy for all rules.
+	// +optional
+	Retries *RouteRetries `json:"retries,omitempty"`
 }
 
 // RouteConditionType defines the condition types for Route status.
 type RouteConditionType string
+
+// RoutePhase defines the high-level lifecycle phase of a Route.
+type RoutePhase string
 
 const (
 	// RouteConditionReady indicates whether the Route is fully reconciled.
 	RouteConditionReady RouteConditionType = "Ready"
 	// RouteConditionSynced indicates whether child resources are in sync.
 	RouteConditionSynced RouteConditionType = "Synced"
+	// RouteConditionCertificateHealthy indicates gateway TLS certificate health.
+	RouteConditionCertificateHealthy RouteConditionType = "CertificateHealthy"
+
+	// RoutePhasePending means one or more backend Services are not found yet.
+	RoutePhasePending RoutePhase = "Pending"
+	// RoutePhaseProvisioning means backends are healthy and resources are being reconciled.
+	RoutePhaseProvisioning RoutePhase = "Provisioning"
+	// RoutePhaseActive means all resources are reconciled and backend dependencies are healthy.
+	RoutePhaseActive RoutePhase = "Active"
+	// RoutePhaseDegraded means reconciliation or backend health checks found a problem.
+	RoutePhaseDegraded RoutePhase = "Degraded"
 )
 
 // RouteStatus defines the observed state of Route.
 type RouteStatus struct {
+	// Phase is the Route lifecycle phase.
+	// +kubebuilder:validation:Enum=Pending;Provisioning;Active;Degraded
+	// +optional
+	Phase RoutePhase `json:"phase,omitempty"`
+
 	// Conditions represent the latest available observations of the Route's state.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
@@ -133,6 +202,7 @@ type RouteStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status"
 // +kubebuilder:printcolumn:name="Synced",type="string",JSONPath=".status.conditions[?(@.type=='Synced')].status"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"

@@ -19,12 +19,17 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -36,19 +41,22 @@ import (
 	istionetv1alpha3 "istio.io/api/networking/v1alpha3"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	platformv1alpha1 "github.com/istio-gateway-operator/route-operator/api/v1alpha1"
+	platformv1alpha1 "github.com/istio-gateway-api-operator/route-operator/api/v1alpha1"
 )
 
 const (
 	routeFinalizer = "istio-gateway-api-operator.io/finalizer"
 	managedByLabel = "istio-gateway-api-operator.io/managed-by"
 	routeNameLabel = "istio-gateway-api-operator.io/route-name"
+	requeueDelay   = 15 * time.Second
+	certWarnBefore = 30 * 24 * time.Hour
 )
 
 // RouteReconciler reconciles a Route object
 type RouteReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=istio-gateway-api-operator.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
@@ -58,16 +66,27 @@ type RouteReconciler struct {
 // +kubebuilder:rbac:groups=networking.istio.io,resources=virtualservices,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.istio.io,resources=destinationrules,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.istio.io,resources=envoyfilters,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=endpoints,verbs=get;list;watch
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;update
 
 func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+	outcome := "error"
+	defer func() {
+		routeReconcileTotal.WithLabelValues(outcome).Inc()
+	}()
 
 	// Fetch the Route instance
 	route := &platformv1alpha1.Route{}
 	if err := r.Get(ctx, req.NamespacedName, route); err != nil {
 		if errors.IsNotFound(err) {
+			outcome = "not_found"
 			return ctrl.Result{}, nil
 		}
+		outcome = "get_error"
 		return ctrl.Result{}, err
 	}
 
@@ -75,13 +94,17 @@ func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	if !route.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(route, routeFinalizer) {
 			if err := r.cleanupOwnedResources(ctx, route); err != nil {
+				outcome = "cleanup_error"
 				return ctrl.Result{}, err
 			}
 			controllerutil.RemoveFinalizer(route, routeFinalizer)
 			if err := r.Update(ctx, route); err != nil {
+				outcome = "finalizer_update_error"
 				return ctrl.Result{}, err
 			}
 		}
+		clearRouteMetrics(route)
+		outcome = "deleted"
 		return ctrl.Result{}, nil
 	}
 
@@ -89,9 +112,82 @@ func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	if !controllerutil.ContainsFinalizer(route, routeFinalizer) {
 		controllerutil.AddFinalizer(route, routeFinalizer)
 		if err := r.Update(ctx, route); err != nil {
+			outcome = "finalizer_add_error"
 			return ctrl.Result{}, err
 		}
 	}
+
+	prevCertCond := r.findCondition(route, string(platformv1alpha1.RouteConditionCertificateHealthy))
+	certStatus, certReason, certMessage, err := r.evaluateGatewayCertificate(ctx, route)
+	if err != nil {
+		outcome = "cert_check_error"
+		return ctrl.Result{}, err
+	}
+	r.setCondition(route, string(platformv1alpha1.RouteConditionCertificateHealthy), certStatus, certReason, certMessage)
+	if r.Recorder != nil && conditionTransitioned(prevCertCond, certStatus, certReason) {
+		eventType := corev1.EventTypeNormal
+		if certStatus != metav1.ConditionTrue {
+			eventType = corev1.EventTypeWarning
+		}
+		r.Recorder.Event(route, eventType, certReason, certMessage)
+	}
+
+	conflicts, err := r.evaluateRouteConflicts(ctx, route)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if len(conflicts) > 0 {
+		msg := fmt.Sprintf("Conflicting route rules detected: %s", strings.Join(conflicts, "; "))
+		route.Status.Phase = platformv1alpha1.RoutePhaseDegraded
+		route.Status.ManagedResources = 0
+		r.setCondition(route, string(platformv1alpha1.RouteConditionSynced), metav1.ConditionFalse, "RouteConflict", msg)
+		r.setCondition(route, string(platformv1alpha1.RouteConditionReady), metav1.ConditionFalse, "RouteConflict", msg)
+		if err := r.Status().Update(ctx, route); err != nil {
+			log.Error(err, "Failed to update Route status for conflict")
+			outcome = "status_update_error"
+			return ctrl.Result{}, err
+		}
+		setRoutePhaseMetric(route, route.Status.Phase)
+		setRouteBackendHealthState(route, "conflict")
+		setManagedResourcesMetric(route, route.Status.ManagedResources)
+		if r.Recorder != nil {
+			r.Recorder.Event(route, corev1.EventTypeWarning, "RouteConflict", msg)
+		}
+		outcome = "conflict"
+		return ctrl.Result{RequeueAfter: requeueDelay}, nil
+	}
+
+	backendHealth, err := r.evaluateBackendHealth(ctx, route)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if !backendHealth.allReady() {
+		phase, reason, message := backendHealth.phaseReasonAndMessage()
+		route.Status.Phase = phase
+		route.Status.ManagedResources = 0
+		r.setCondition(route, string(platformv1alpha1.RouteConditionSynced), metav1.ConditionFalse, reason, message)
+		r.setCondition(route, string(platformv1alpha1.RouteConditionReady), metav1.ConditionFalse, reason, message)
+		if err := r.Status().Update(ctx, route); err != nil {
+			log.Error(err, "Failed to update Route status for backend health")
+			outcome = "status_update_error"
+			return ctrl.Result{}, err
+		}
+		setRoutePhaseMetric(route, route.Status.Phase)
+		if phase == platformv1alpha1.RoutePhasePending {
+			setRouteBackendHealthState(route, "missing_service")
+		} else {
+			setRouteBackendHealthState(route, "zero_endpoints")
+		}
+		setManagedResourcesMetric(route, route.Status.ManagedResources)
+		if r.Recorder != nil {
+			r.Recorder.Event(route, corev1.EventTypeWarning, reason, message)
+		}
+		outcome = "backend_blocked"
+		return ctrl.Result{RequeueAfter: requeueDelay}, nil
+	}
+
+	route.Status.Phase = platformv1alpha1.RoutePhaseProvisioning
 
 	// Reconcile child resources
 	managedCount := 0
@@ -120,8 +216,8 @@ func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 
-	// 3. VirtualService (if timeout or CORS)
-	if route.Spec.Timeout != "" || route.Spec.CORS != nil {
+	// 3. VirtualService (if timeout, CORS, or retries)
+	if route.Spec.Timeout != "" || route.Spec.CORS != nil || route.Spec.Retries != nil {
 		if err := r.reconcileVirtualService(ctx, route); err != nil {
 			log.Error(err, "Failed to reconcile VirtualService")
 			reconcileErr = err
@@ -163,19 +259,258 @@ func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	// Update status
 	route.Status.ManagedResources = managedCount
 	if reconcileErr != nil {
+		route.Status.Phase = platformv1alpha1.RoutePhaseDegraded
 		r.setCondition(route, string(platformv1alpha1.RouteConditionSynced), metav1.ConditionFalse, "ReconcileError", reconcileErr.Error())
 		r.setCondition(route, string(platformv1alpha1.RouteConditionReady), metav1.ConditionFalse, "NotReady", "Some resources failed to reconcile")
+		if r.Recorder != nil {
+			r.Recorder.Event(route, corev1.EventTypeWarning, "ReconcileError", reconcileErr.Error())
+		}
 	} else {
+		route.Status.Phase = platformv1alpha1.RoutePhaseActive
 		r.setCondition(route, string(platformv1alpha1.RouteConditionSynced), metav1.ConditionTrue, "ReconcileSuccess", "All resources synced")
 		r.setCondition(route, string(platformv1alpha1.RouteConditionReady), metav1.ConditionTrue, "Available", "All resources available")
+		if r.Recorder != nil {
+			r.Recorder.Event(route, corev1.EventTypeNormal, "RouteActive", "All resources synced and backend dependencies are healthy")
+		}
 	}
 
 	if err := r.Status().Update(ctx, route); err != nil {
 		log.Error(err, "Failed to update Route status")
+		outcome = "status_update_error"
 		return ctrl.Result{}, err
 	}
 
+	setRoutePhaseMetric(route, route.Status.Phase)
+	setRouteBackendHealthState(route, "healthy")
+	setManagedResourcesMetric(route, route.Status.ManagedResources)
+	if reconcileErr != nil {
+		outcome = "reconcile_error"
+	} else {
+		outcome = "success"
+	}
+
 	return ctrl.Result{}, reconcileErr
+}
+
+func conditionTransitioned(previous *metav1.Condition, newStatus metav1.ConditionStatus, newReason string) bool {
+	if previous == nil {
+		return true
+	}
+	return previous.Status != newStatus || previous.Reason != newReason
+}
+
+type backendHealthSummary struct {
+	MissingServices []string
+	ZeroEndpoints   []string
+}
+
+func (s backendHealthSummary) allReady() bool {
+	return len(s.MissingServices) == 0 && len(s.ZeroEndpoints) == 0
+}
+
+func (s backendHealthSummary) phaseReasonAndMessage() (platformv1alpha1.RoutePhase, string, string) {
+	if len(s.MissingServices) > 0 {
+		return platformv1alpha1.RoutePhasePending, "BackendServiceMissing", fmt.Sprintf("Waiting for backend Services: %s", strings.Join(s.MissingServices, ", "))
+	}
+	if len(s.ZeroEndpoints) > 0 {
+		return platformv1alpha1.RoutePhaseDegraded, "BackendNoEndpoints", fmt.Sprintf("Backends have zero ready endpoints: %s", strings.Join(s.ZeroEndpoints, ", "))
+	}
+	return platformv1alpha1.RoutePhaseProvisioning, "BackendsReady", "All backend dependencies are ready"
+}
+
+func (r *RouteReconciler) evaluateBackendHealth(ctx context.Context, route *platformv1alpha1.Route) (backendHealthSummary, error) {
+	seenServices := make(map[string]struct{})
+	summary := backendHealthSummary{}
+
+	for _, rule := range route.Spec.Rules {
+		serviceName := rule.Backend.ServiceName
+		serviceKey := route.Namespace + "/" + serviceName
+		if _, seen := seenServices[serviceKey]; seen {
+			continue
+		}
+		seenServices[serviceKey] = struct{}{}
+
+		svc := &corev1.Service{}
+		err := r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: route.Namespace}, svc)
+		if errors.IsNotFound(err) {
+			summary.MissingServices = append(summary.MissingServices, serviceName)
+			continue
+		}
+		if err != nil {
+			return summary, err
+		}
+
+		ep := &corev1.Endpoints{}
+		err = r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: route.Namespace}, ep)
+		if errors.IsNotFound(err) {
+			summary.ZeroEndpoints = append(summary.ZeroEndpoints, serviceName)
+			continue
+		}
+		if err != nil {
+			return summary, err
+		}
+
+		if !hasReadyEndpoints(ep) {
+			summary.ZeroEndpoints = append(summary.ZeroEndpoints, serviceName)
+		}
+	}
+
+	return summary, nil
+}
+
+func hasReadyEndpoints(ep *corev1.Endpoints) bool {
+	for _, subset := range ep.Subsets {
+		if len(subset.Addresses) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *RouteReconciler) evaluateGatewayCertificate(ctx context.Context, route *platformv1alpha1.Route) (metav1.ConditionStatus, string, string, error) {
+	gwName, gwNs := r.gatewayRef(route)
+	gw := &gatewayv1.Gateway{}
+	err := r.Get(ctx, types.NamespacedName{Name: gwName, Namespace: gwNs}, gw)
+	if errors.IsNotFound(err) {
+		return metav1.ConditionFalse, "GatewayNotFound", fmt.Sprintf("Gateway %s/%s not found for certificate check", gwNs, gwName), nil
+	}
+	if err != nil {
+		return metav1.ConditionUnknown, "CertificateCheckFailed", fmt.Sprintf("failed to get Gateway %s/%s: %v", gwNs, gwName, err), err
+	}
+
+	var earliestExpiry *time.Time
+	hasTLSRef := false
+	for _, listener := range gw.Spec.Listeners {
+		if string(listener.Protocol) != "HTTPS" || listener.TLS == nil {
+			continue
+		}
+
+		for _, ref := range listener.TLS.CertificateRefs {
+			if ref.Group != nil && string(*ref.Group) != "" {
+				continue
+			}
+			if ref.Kind != nil && string(*ref.Kind) != "Secret" {
+				continue
+			}
+			hasTLSRef = true
+
+			secretNs := gwNs
+			if ref.Namespace != nil && string(*ref.Namespace) != "" {
+				secretNs = string(*ref.Namespace)
+			}
+
+			secret := &corev1.Secret{}
+			err := r.Get(ctx, types.NamespacedName{Name: string(ref.Name), Namespace: secretNs}, secret)
+			if errors.IsNotFound(err) {
+				return metav1.ConditionFalse, "CertificateSecretMissing", fmt.Sprintf("TLS secret %s/%s not found", secretNs, string(ref.Name)), nil
+			}
+			if err != nil {
+				return metav1.ConditionUnknown, "CertificateCheckFailed", fmt.Sprintf("failed to get TLS secret %s/%s: %v", secretNs, string(ref.Name), err), err
+			}
+
+			notAfter, err := parseTLSCertNotAfter(secret)
+			if err != nil {
+				return metav1.ConditionFalse, "CertificateParseError", err.Error(), nil
+			}
+
+			if earliestExpiry == nil || notAfter.Before(*earliestExpiry) {
+				t := notAfter
+				earliestExpiry = &t
+			}
+		}
+	}
+
+	if !hasTLSRef {
+		return metav1.ConditionTrue, "CertificateNotConfigured", "Gateway has no HTTPS TLS certificateRefs to monitor", nil
+	}
+	if earliestExpiry == nil {
+		return metav1.ConditionTrue, "CertificateNotConfigured", "Gateway has no supported Secret certificateRefs to monitor", nil
+	}
+
+	status, reason, message := certificateExpiryState(time.Now(), *earliestExpiry, certWarnBefore)
+	return metav1.ConditionStatus(status), reason, message, nil
+}
+
+type routeRuleIdentity struct {
+	GatewayNamespace string
+	GatewayName      string
+	Host             string
+	Path             string
+}
+
+func normalizeRoutePath(path string) string {
+	if path == "" {
+		return "/"
+	}
+	return path
+}
+
+func ruleIdentity(route *platformv1alpha1.Route, rule platformv1alpha1.RouteRule) routeRuleIdentity {
+	gwName := "istio-gateway"
+	gwNs := "istio-system"
+	if route.Spec.Gateway != nil {
+		if route.Spec.Gateway.Name != "" {
+			gwName = route.Spec.Gateway.Name
+		}
+		if route.Spec.Gateway.Namespace != "" {
+			gwNs = route.Spec.Gateway.Namespace
+		}
+	}
+
+	return routeRuleIdentity{
+		GatewayNamespace: gwNs,
+		GatewayName:      gwName,
+		Host:             rule.Host,
+		Path:             normalizeRoutePath(rule.Path),
+	}
+}
+
+func routePrecedes(a, b *platformv1alpha1.Route) bool {
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return a.CreationTimestamp.Before(&b.CreationTimestamp)
+	}
+	if a.Namespace != b.Namespace {
+		return a.Namespace < b.Namespace
+	}
+	return a.Name < b.Name
+}
+
+func (r *RouteReconciler) evaluateRouteConflicts(ctx context.Context, route *platformv1alpha1.Route) ([]string, error) {
+	allRoutes := &platformv1alpha1.RouteList{}
+	if err := r.List(ctx, allRoutes); err != nil {
+		return nil, err
+	}
+
+	currentRules := make(map[routeRuleIdentity]struct{})
+	for _, rule := range route.Spec.Rules {
+		currentRules[ruleIdentity(route, rule)] = struct{}{}
+	}
+
+	conflicts := make(map[string]struct{})
+	for i := range allRoutes.Items {
+		other := &allRoutes.Items[i]
+		if other.Name == route.Name && other.Namespace == route.Namespace {
+			continue
+		}
+		if !other.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if !routePrecedes(route, other) {
+			for _, otherRule := range other.Spec.Rules {
+				id := ruleIdentity(other, otherRule)
+				if _, exists := currentRules[id]; exists {
+					conflicts[fmt.Sprintf("%s/%s host=%s path=%s gateway=%s/%s", other.Namespace, other.Name, id.Host, id.Path, id.GatewayNamespace, id.GatewayName)] = struct{}{}
+				}
+			}
+		}
+	}
+
+	var out []string
+	for c := range conflicts {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 func (r *RouteReconciler) gatewayRef(route *platformv1alpha1.Route) (string, string) {
@@ -225,6 +560,7 @@ func (r *RouteReconciler) reconcileHTTPRoute(ctx context.Context, route *platfor
 						Value: &path,
 					},
 				}},
+				Filters: buildGatewayHTTPHeaderFilters(rule.Headers),
 				BackendRefs: []gatewayv1.HTTPBackendRef{{
 					BackendRef: gatewayv1.BackendRef{
 						BackendObjectReference: gatewayv1.BackendObjectReference{
@@ -330,6 +666,9 @@ func (r *RouteReconciler) reconcileVirtualService(ctx context.Context, route *pl
 			}
 			httpRoute.CorsPolicy = corsPolicy
 		}
+		httpRoute.Headers = buildIstioHeaders(rule.Headers)
+
+		httpRoute.Retries = buildIstioHTTPRetry(route.Spec.Retries)
 
 		httpRoutes = append(httpRoutes, httpRoute)
 	}
@@ -349,6 +688,128 @@ func (r *RouteReconciler) reconcileVirtualService(ctx context.Context, route *pl
 	vs.Spec.Http = httpRoutes
 
 	return r.createOrUpdate(ctx, route, vs)
+}
+
+func buildIstioHTTPRetry(retries *platformv1alpha1.RouteRetries) *istionetv1.HTTPRetry {
+	if retries == nil {
+		return nil
+	}
+
+	httpRetry := &istionetv1.HTTPRetry{Attempts: retries.Attempts}
+	if retries.RetryOn != "" {
+		httpRetry.RetryOn = retries.RetryOn
+	}
+	if retries.PerTryTimeout != "" {
+		d, err := parseDuration(retries.PerTryTimeout)
+		if err == nil {
+			httpRetry.PerTryTimeout = d
+		}
+	}
+
+	return httpRetry
+}
+
+func buildGatewayHTTPHeaderFilters(headers *platformv1alpha1.RouteHeaders) []gatewayv1.HTTPRouteFilter {
+	if headers == nil {
+		return nil
+	}
+
+	filters := make([]gatewayv1.HTTPRouteFilter, 0, 2)
+	if requestFilter := buildGatewayHTTPHeaderFilter(headers.Request); requestFilter != nil {
+		filters = append(filters, gatewayv1.HTTPRouteFilter{
+			Type:                  gatewayv1.HTTPRouteFilterRequestHeaderModifier,
+			RequestHeaderModifier: requestFilter,
+		})
+	}
+	if responseFilter := buildGatewayHTTPHeaderFilter(headers.Response); responseFilter != nil {
+		filters = append(filters, gatewayv1.HTTPRouteFilter{
+			Type:                   gatewayv1.HTTPRouteFilterResponseHeaderModifier,
+			ResponseHeaderModifier: responseFilter,
+		})
+	}
+
+	if len(filters) == 0 {
+		return nil
+	}
+	return filters
+}
+
+func buildGatewayHTTPHeaderFilter(ops *platformv1alpha1.RouteHeaderOperations) *gatewayv1.HTTPHeaderFilter {
+	if !hasHeaderOperations(ops) {
+		return nil
+	}
+
+	out := &gatewayv1.HTTPHeaderFilter{}
+	for _, k := range sortedMapKeys(ops.Set) {
+		out.Set = append(out.Set, gatewayv1.HTTPHeader{Name: gatewayv1.HTTPHeaderName(k), Value: ops.Set[k]})
+	}
+	for _, k := range sortedMapKeys(ops.Add) {
+		out.Add = append(out.Add, gatewayv1.HTTPHeader{Name: gatewayv1.HTTPHeaderName(k), Value: ops.Add[k]})
+	}
+	if len(ops.Remove) > 0 {
+		out.Remove = append([]string(nil), ops.Remove...)
+	}
+
+	return out
+}
+
+func buildIstioHeaders(headers *platformv1alpha1.RouteHeaders) *istionetv1.Headers {
+	if headers == nil {
+		return nil
+	}
+
+	requestOps := buildIstioHeaderOperations(headers.Request)
+	responseOps := buildIstioHeaderOperations(headers.Response)
+	if requestOps == nil && responseOps == nil {
+		return nil
+	}
+
+	return &istionetv1.Headers{
+		Request:  requestOps,
+		Response: responseOps,
+	}
+}
+
+func buildIstioHeaderOperations(ops *platformv1alpha1.RouteHeaderOperations) *istionetv1.Headers_HeaderOperations {
+	if !hasHeaderOperations(ops) {
+		return nil
+	}
+
+	out := &istionetv1.Headers_HeaderOperations{}
+	if len(ops.Set) > 0 {
+		out.Set = make(map[string]string, len(ops.Set))
+		for k, v := range ops.Set {
+			out.Set[k] = v
+		}
+	}
+	if len(ops.Add) > 0 {
+		out.Add = make(map[string]string, len(ops.Add))
+		for k, v := range ops.Add {
+			out.Add[k] = v
+		}
+	}
+	if len(ops.Remove) > 0 {
+		out.Remove = append([]string(nil), ops.Remove...)
+	}
+
+	return out
+}
+
+func hasHeaderOperations(ops *platformv1alpha1.RouteHeaderOperations) bool {
+	return ops != nil && (len(ops.Set) > 0 || len(ops.Add) > 0 || len(ops.Remove) > 0)
+}
+
+func sortedMapKeys(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
+	}
+
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func (r *RouteReconciler) reconcileDestinationRule(ctx context.Context, route *platformv1alpha1.Route, index int, rule platformv1alpha1.RouteRule) error {
@@ -489,6 +950,16 @@ func (r *RouteReconciler) managedLabels(route *platformv1alpha1.Route) map[strin
 		managedByLabel: "route-operator",
 		routeNameLabel: route.Name,
 	}
+}
+
+func (r *RouteReconciler) findCondition(route *platformv1alpha1.Route, condType string) *metav1.Condition {
+	for i := range route.Status.Conditions {
+		if route.Status.Conditions[i].Type == condType {
+			c := route.Status.Conditions[i]
+			return &c
+		}
+	}
+	return nil
 }
 
 func (r *RouteReconciler) setCondition(route *platformv1alpha1.Route, condType string, status metav1.ConditionStatus, reason, message string) {

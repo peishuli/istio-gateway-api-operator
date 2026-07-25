@@ -2,7 +2,7 @@
 
 A Kubernetes operator that simplifies exposing services through the Istio Gateway API. Define a single `Route` resource and the operator generates all the underlying resources (HTTPRoute, VirtualService, DestinationRule, EnvoyFilter) automatically.
 
-## Rationale
+## Why
 
 The Kubernetes Gateway API with Istio requires managing multiple resource types to expose a single service — HTTPRoutes for routing, VirtualServices for timeouts/CORS, DestinationRules for TLS backends, EnvoyFilters for body size limits, plus HTTP→HTTPS redirects. This operator collapses all of that into one namespaced `Route` resource.
 
@@ -248,14 +248,15 @@ This project is technically a **controller** — it watches a CRD and reconciles
 ## Roadmap
 
 - [ ] **Admission Webhooks** — Validating webhook to reject Routes where `host` doesn't match the Gateway's hostname pattern; mutating webhook to auto-inject gateway refs; reject conflicting Routes (same host+path)
-- [ ] **Multi-phase Status** — `status.phase` state machine: `Pending` → `Provisioning` → `Active` → `Degraded`. Don't create HTTPRoute until backend Service + Endpoints exist.
-- [ ] **Backend Health Awareness** — Detect zero-endpoint backends, set phase to `Degraded`, emit warning events, auto-recover when endpoints return
-- [ ] **Certificate Expiry Tracking** — Monitor Gateway TLS secret expiry, surface warnings in Route status conditions
-- [ ] **Custom Prometheus Metrics** — `route_reconcile_total`, `route_status_phase`, `route_backend_health`, `route_managed_resources`
+- [x] **Multi-phase Status** — `status.phase` state machine implemented (`Pending`/`Provisioning`/`Active`/`Degraded`). Reconciliation now gates on backend readiness before generating managed resources.
+- [x] **Backend Health Awareness** — Controller detects missing Service or zero-endpoint backends, sets status phase/conditions accordingly, emits warning events, and requeues for automatic recovery.
+- [x] **Runtime Route Conflict Guard** — Controller detects gateway+host+path conflicts and marks one side `Degraded` with reason `RouteConflict` while allowing the selected winner to reconcile.
+- [x] **Certificate Expiry Tracking** — Controller inspects Gateway HTTPS TLS `certificateRefs` secrets and reports `CertificateHealthy` condition (`CertificateHealthy`, `CertificateExpiring`, `CertificateExpired`, `CertificateSecretMissing`, etc.).
+- [x] **Custom Prometheus Metrics** — `route_reconcile_total`, `route_status_phase`, `route_backend_health`, `route_managed_resources` exported by controller-runtime metrics endpoint.
 - [ ] **Rate Limiting** — `spec.rateLimit` field to auto-generate Istio EnvoyFilter with local/global rate limiting
 - [ ] **Canary / Traffic Splitting** — `spec.canary` field with weight-based splitting between two backends, automated rollback on 5xx threshold
-- [ ] **Retry Policy** — `spec.retries` field to configure Istio retry policy (attempts, perTryTimeout, retryOn)
-- [ ] **Header Manipulation** — `spec.rules[].headers` for request/response header add/remove/set
+- [x] **Retry Policy** — `spec.retries` field configures Istio `VirtualService` retry policy (`attempts`, `perTryTimeout`, `retryOn`) across all generated HTTP routes.
+- [x] **Header Manipulation** — `spec.rules[].headers` supports request/response header add/remove/set and is translated into Gateway API header modifier filters plus Istio `VirtualService` header operations.
 - [ ] **Authentication Integration** — `spec.auth` to auto-generate Istio `RequestAuthentication` + `AuthorizationPolicy`
 
 ## Toolchain Versions
