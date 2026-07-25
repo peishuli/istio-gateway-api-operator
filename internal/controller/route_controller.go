@@ -221,8 +221,8 @@ func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 
-	// 3. VirtualService (if timeout, CORS, or retries)
-	if route.Spec.Timeout != "" || route.Spec.CORS != nil || route.Spec.Retries != nil {
+	// 3. VirtualService (if timeout, CORS, retries, or canary split)
+	if route.Spec.Timeout != "" || route.Spec.CORS != nil || route.Spec.Retries != nil || route.Spec.Canary != nil {
 		if err := r.reconcileVirtualService(ctx, route); err != nil {
 			log.Error(err, "Failed to reconcile VirtualService")
 			reconcileErr = err
@@ -234,18 +234,20 @@ func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	// 4. DestinationRules (for HTTPS backends)
 	drIndex := 0
 	for _, rule := range route.Spec.Rules {
-		protocol := rule.Backend.Protocol
-		if protocol == "" {
-			protocol = "HTTP"
-		}
-		if protocol == "HTTPS" {
-			if err := r.reconcileDestinationRule(ctx, route, drIndex, rule); err != nil {
-				log.Error(err, "Failed to reconcile DestinationRule")
-				reconcileErr = err
-			} else {
-				managedCount++
+		for _, backend := range routeRuleBackends(rule, route.Spec.Canary) {
+			protocol := backend.Protocol
+			if protocol == "" {
+				protocol = "HTTP"
 			}
-			drIndex++
+			if protocol == "HTTPS" {
+				if err := r.reconcileDestinationRule(ctx, route, drIndex, backend); err != nil {
+					log.Error(err, "Failed to reconcile DestinationRule")
+					reconcileErr = err
+				} else {
+					managedCount++
+				}
+				drIndex++
+			}
 		}
 	}
 
@@ -364,35 +366,37 @@ func (r *RouteReconciler) evaluateBackendHealth(ctx context.Context, route *plat
 	summary := backendHealthSummary{}
 
 	for _, rule := range route.Spec.Rules {
-		serviceName := rule.Backend.ServiceName
-		serviceKey := route.Namespace + "/" + serviceName
-		if _, seen := seenServices[serviceKey]; seen {
-			continue
-		}
-		seenServices[serviceKey] = struct{}{}
+		for _, backend := range routeRuleBackends(rule, route.Spec.Canary) {
+			serviceName := backend.ServiceName
+			serviceKey := route.Namespace + "/" + serviceName
+			if _, seen := seenServices[serviceKey]; seen {
+				continue
+			}
+			seenServices[serviceKey] = struct{}{}
 
-		svc := &corev1.Service{}
-		err := r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: route.Namespace}, svc)
-		if errors.IsNotFound(err) {
-			summary.MissingServices = append(summary.MissingServices, serviceName)
-			continue
-		}
-		if err != nil {
-			return summary, err
-		}
+			svc := &corev1.Service{}
+			err := r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: route.Namespace}, svc)
+			if errors.IsNotFound(err) {
+				summary.MissingServices = append(summary.MissingServices, serviceName)
+				continue
+			}
+			if err != nil {
+				return summary, err
+			}
 
-		ep := &corev1.Endpoints{}
-		err = r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: route.Namespace}, ep)
-		if errors.IsNotFound(err) {
-			summary.ZeroEndpoints = append(summary.ZeroEndpoints, serviceName)
-			continue
-		}
-		if err != nil {
-			return summary, err
-		}
+			ep := &corev1.Endpoints{}
+			err = r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: route.Namespace}, ep)
+			if errors.IsNotFound(err) {
+				summary.ZeroEndpoints = append(summary.ZeroEndpoints, serviceName)
+				continue
+			}
+			if err != nil {
+				return summary, err
+			}
 
-		if !hasReadyEndpoints(ep) {
-			summary.ZeroEndpoints = append(summary.ZeroEndpoints, serviceName)
+			if !hasReadyEndpoints(ep) {
+				summary.ZeroEndpoints = append(summary.ZeroEndpoints, serviceName)
+			}
 		}
 	}
 
@@ -578,6 +582,31 @@ func (r *RouteReconciler) reconcileHTTPRoute(ctx context.Context, route *platfor
 	}
 	pathType := gatewayv1.PathMatchPathPrefix
 	port := gatewayv1.PortNumber(rule.Backend.ServicePort)
+	backendRefs := []gatewayv1.HTTPBackendRef{{
+		BackendRef: gatewayv1.BackendRef{
+			BackendObjectReference: gatewayv1.BackendObjectReference{
+				Name: gatewayv1.ObjectName(rule.Backend.ServiceName),
+				Port: &port,
+			},
+		},
+	}}
+
+	if route.Spec.Canary != nil {
+		canaryWeight := route.Spec.Canary.Weight
+		primaryWeight := int32(100 - canaryWeight)
+		backendRefs[0].Weight = &primaryWeight
+
+		canaryPort := gatewayv1.PortNumber(route.Spec.Canary.Backend.ServicePort)
+		backendRefs = append(backendRefs, gatewayv1.HTTPBackendRef{
+			BackendRef: gatewayv1.BackendRef{
+				BackendObjectReference: gatewayv1.BackendObjectReference{
+					Name: gatewayv1.ObjectName(route.Spec.Canary.Backend.ServiceName),
+					Port: &canaryPort,
+				},
+				Weight: &canaryWeight,
+			},
+		})
+	}
 
 	hr := &gatewayv1.HTTPRoute{
 		ObjectMeta: metav1.ObjectMeta{
@@ -602,14 +631,7 @@ func (r *RouteReconciler) reconcileHTTPRoute(ctx context.Context, route *platfor
 					},
 				}},
 				Filters: buildGatewayHTTPHeaderFilters(rule.Headers),
-				BackendRefs: []gatewayv1.HTTPBackendRef{{
-					BackendRef: gatewayv1.BackendRef{
-						BackendObjectReference: gatewayv1.BackendObjectReference{
-							Name: gatewayv1.ObjectName(rule.Backend.ServiceName),
-							Port: &port,
-						},
-					},
-				}},
+				BackendRefs: backendRefs,
 			}},
 		},
 	}
@@ -669,12 +691,7 @@ func (r *RouteReconciler) reconcileVirtualService(ctx context.Context, route *pl
 				Uri:     &istionetv1.StringMatch{MatchType: &istionetv1.StringMatch_Prefix{Prefix: path}},
 				Headers: map[string]*istionetv1.StringMatch{":authority": {MatchType: &istionetv1.StringMatch_Exact{Exact: rule.Host}}},
 			}},
-			Route: []*istionetv1.HTTPRouteDestination{{
-				Destination: &istionetv1.Destination{
-					Host: fmt.Sprintf("%s.%s.svc.cluster.local", rule.Backend.ServiceName, route.Namespace),
-					Port: &istionetv1.PortSelector{Number: uint32(rule.Backend.ServicePort)},
-				},
-			}},
+			Route: buildIstioRouteDestinations(route.Namespace, rule.Backend, route.Spec.Canary),
 		}
 
 		if route.Spec.Timeout != "" {
@@ -748,6 +765,39 @@ func buildIstioHTTPRetry(retries *platformv1alpha1.RouteRetries) *istionetv1.HTT
 	}
 
 	return httpRetry
+}
+
+func routeRuleBackends(rule platformv1alpha1.RouteRule, canary *platformv1alpha1.RouteCanary) []platformv1alpha1.RouteBackend {
+	backends := []platformv1alpha1.RouteBackend{rule.Backend}
+	if canary != nil {
+		backends = append(backends, canary.Backend)
+	}
+	return backends
+}
+
+func buildIstioRouteDestinations(routeNamespace string, primary platformv1alpha1.RouteBackend, canary *platformv1alpha1.RouteCanary) []*istionetv1.HTTPRouteDestination {
+	dests := []*istionetv1.HTTPRouteDestination{{
+		Destination: &istionetv1.Destination{
+			Host: fmt.Sprintf("%s.%s.svc.cluster.local", primary.ServiceName, routeNamespace),
+			Port: &istionetv1.PortSelector{Number: uint32(primary.ServicePort)},
+		},
+	}}
+
+	if canary == nil {
+		return dests
+	}
+
+	primaryWeight := int32(100 - canary.Weight)
+	dests[0].Weight = primaryWeight
+	dests = append(dests, &istionetv1.HTTPRouteDestination{
+		Destination: &istionetv1.Destination{
+			Host: fmt.Sprintf("%s.%s.svc.cluster.local", canary.Backend.ServiceName, routeNamespace),
+			Port: &istionetv1.PortSelector{Number: uint32(canary.Backend.ServicePort)},
+		},
+		Weight: canary.Weight,
+	})
+
+	return dests
 }
 
 func buildGatewayHTTPHeaderFilters(headers *platformv1alpha1.RouteHeaders) []gatewayv1.HTTPRouteFilter {
@@ -1070,7 +1120,7 @@ func (r *RouteReconciler) deleteRateLimitEnvoyFilter(ctx context.Context, route 
 	return nil
 }
 
-func (r *RouteReconciler) reconcileDestinationRule(ctx context.Context, route *platformv1alpha1.Route, index int, rule platformv1alpha1.RouteRule) error {
+func (r *RouteReconciler) reconcileDestinationRule(ctx context.Context, route *platformv1alpha1.Route, index int, backend platformv1alpha1.RouteBackend) error {
 	_, gwNs := r.gatewayRef(route)
 
 	dr := &networkingv1.DestinationRule{
@@ -1080,10 +1130,10 @@ func (r *RouteReconciler) reconcileDestinationRule(ctx context.Context, route *p
 			Labels:    r.managedLabels(route),
 		},
 	}
-	dr.Spec.Host = fmt.Sprintf("%s.%s.svc.cluster.local", rule.Backend.ServiceName, route.Namespace)
+	dr.Spec.Host = fmt.Sprintf("%s.%s.svc.cluster.local", backend.ServiceName, route.Namespace)
 	dr.Spec.TrafficPolicy = &istionetv1.TrafficPolicy{
 		PortLevelSettings: []*istionetv1.TrafficPolicy_PortTrafficPolicy{{
-			Port: &istionetv1.PortSelector{Number: uint32(rule.Backend.ServicePort)},
+			Port: &istionetv1.PortSelector{Number: uint32(backend.ServicePort)},
 			Tls: &istionetv1.ClientTLSSettings{
 				Mode:               istionetv1.ClientTLSSettings_SIMPLE,
 				InsecureSkipVerify: &wrapperspb_BoolValue{Value: true},

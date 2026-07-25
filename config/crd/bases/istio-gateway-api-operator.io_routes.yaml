@@ -75,6 +75,45 @@ spec:
                 required:
                 - issuer
                 type: object
+              canary:
+                description: Canary configures weighted traffic splitting to a secondary
+                  backend.
+                properties:
+                  backend:
+                    description: Backend defines the canary target service.
+                    properties:
+                      protocol:
+                        default: HTTP
+                        description: Protocol is the protocol the backend expects.
+                          HTTPS triggers a DestinationRule.
+                        enum:
+                        - HTTP
+                        - HTTPS
+                        type: string
+                      serviceName:
+                        description: ServiceName is the target Kubernetes Service
+                          name.
+                        type: string
+                      servicePort:
+                        description: ServicePort is the target Service port number.
+                        format: int32
+                        type: integer
+                    required:
+                    - serviceName
+                    - servicePort
+                    type: object
+                  weight:
+                    description: |-
+                      Weight is the percentage of traffic sent to canary backend.
+                      Remaining traffic goes to the primary rule backend.
+                    format: int32
+                    maximum: 99
+                    minimum: 1
+                    type: integer
+                required:
+                - backend
+                - weight
+                type: object
               cors:
                 description: CORS is the CORS policy applied to all rules. Omit to
                   disable CORS.

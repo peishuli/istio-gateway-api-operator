@@ -162,6 +162,18 @@ type RouteRateLimit struct {
 	Burst *int32 `json:"burst,omitempty"`
 }
 
+// RouteCanary defines weighted canary traffic split to a secondary backend.
+type RouteCanary struct {
+	// Backend defines the canary target service.
+	Backend RouteBackend `json:"backend"`
+
+	// Weight is the percentage of traffic sent to canary backend.
+	// Remaining traffic goes to the primary rule backend.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=99
+	Weight int32 `json:"weight"`
+}
+
 // RouteSpec defines the desired state of Route.
 type RouteSpec struct {
 	// Rules is a list of routing rules. Each rule maps a host+path to a backend service.
@@ -200,6 +212,10 @@ type RouteSpec struct {
 	// RateLimit configures local token-bucket rate limiting at the gateway.
 	// +optional
 	RateLimit *RouteRateLimit `json:"rateLimit,omitempty"`
+
+	// Canary configures weighted traffic splitting to a secondary backend.
+	// +optional
+	Canary *RouteCanary `json:"canary,omitempty"`
 }
 
 // RouteConditionType defines the condition types for Route status.
