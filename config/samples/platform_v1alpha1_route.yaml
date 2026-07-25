@@ -5,7 +5,7 @@ metadata:
   namespace: default
 spec:
   rules:
-    - host: nginx.newrezk8snonprod.com
+    - host: nginx.examples.com
       backend:
         serviceName: nginx
         servicePort: 80
