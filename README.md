@@ -257,7 +257,7 @@ This project is technically a **controller** — it watches a CRD and reconciles
 - [ ] **Canary / Traffic Splitting** — `spec.canary` field with weight-based splitting between two backends, automated rollback on 5xx threshold
 - [x] **Retry Policy** — `spec.retries` field configures Istio `VirtualService` retry policy (`attempts`, `perTryTimeout`, `retryOn`) across all generated HTTP routes.
 - [x] **Header Manipulation** — `spec.rules[].headers` supports request/response header add/remove/set and is translated into Gateway API header modifier filters plus Istio `VirtualService` header operations.
-- [ ] **Authentication Integration** — `spec.auth` to auto-generate Istio `RequestAuthentication` + `AuthorizationPolicy`
+- [x] **Authentication Integration** — `spec.auth` now auto-generates Istio `RequestAuthentication` and host/path-scoped `AuthorizationPolicy` for JWT-protected traffic.
 
 ## Toolchain Versions
 

@@ -52,6 +52,29 @@ spec:
           spec:
             description: RouteSpec defines the desired state of Route.
             properties:
+              auth:
+                description: Auth configures Istio RequestAuthentication + AuthorizationPolicy
+                  resources.
+                properties:
+                  audiences:
+                    description: Audiences limits accepted JWT audiences.
+                    items:
+                      type: string
+                    type: array
+                  forwardOriginalToken:
+                    description: ForwardOriginalToken keeps the original token in
+                      upstream requests.
+                    type: boolean
+                  issuer:
+                    description: Issuer is the JWT issuer URL or identifier.
+                    type: string
+                  jwksUri:
+                    description: JWKSURI optionally overrides OpenID discovery with
+                      explicit JWKS URI.
+                    type: string
+                required:
+                - issuer
+                type: object
               cors:
                 description: CORS is the CORS policy applied to all rules. Omit to
                   disable CORS.

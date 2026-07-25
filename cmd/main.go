@@ -39,10 +39,11 @@ import (
 
 	networkingv1 "istio.io/client-go/pkg/apis/networking/v1"
 	istiov1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	securityv1beta1 "istio.io/client-go/pkg/apis/security/v1beta1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	platformv1alpha1 "github.com/istio-gateway-operator/route-operator/api/v1alpha1"
-	"github.com/istio-gateway-operator/route-operator/internal/controller"
+	platformv1alpha1 "github.com/istio-gateway-api-operator/route-operator/api/v1alpha1"
+	"github.com/istio-gateway-api-operator/route-operator/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -56,6 +57,7 @@ func init() {
 	utilruntime.Must(gatewayv1.Install(scheme))
 	utilruntime.Must(networkingv1.AddToScheme(scheme))
 	utilruntime.Must(istiov1alpha3.AddToScheme(scheme))
+	utilruntime.Must(securityv1beta1.AddToScheme(scheme))
 
 	utilruntime.Must(platformv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
@@ -210,8 +212,9 @@ func main() {
 	}
 
 	if err := (&controller.RouteReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("route-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Route")
 		os.Exit(1)

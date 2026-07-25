@@ -39,9 +39,12 @@ import (
 	istiov1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
 	istionetv1 "istio.io/api/networking/v1"
 	istionetv1alpha3 "istio.io/api/networking/v1alpha3"
+	istiosecv1beta1 "istio.io/api/security/v1beta1"
+	istiotypev1beta1 "istio.io/api/type/v1beta1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	platformv1alpha1 "github.com/istio-gateway-api-operator/route-operator/api/v1alpha1"
+	securityv1beta1 "istio.io/client-go/pkg/apis/security/v1beta1"
 )
 
 const (
@@ -66,6 +69,8 @@ type RouteReconciler struct {
 // +kubebuilder:rbac:groups=networking.istio.io,resources=virtualservices,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.istio.io,resources=destinationrules,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.istio.io,resources=envoyfilters,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=security.istio.io,resources=requestauthentications,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=security.istio.io,resources=authorizationpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=endpoints,verbs=get;list;watch
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch
@@ -253,6 +258,27 @@ func (r *RouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			} else {
 				managedCount++
 			}
+		}
+	}
+
+	// 6. Authentication Integration (if auth enabled)
+	if route.Spec.Auth != nil {
+		if err := r.reconcileRequestAuthentication(ctx, route); err != nil {
+			log.Error(err, "Failed to reconcile RequestAuthentication")
+			reconcileErr = err
+		} else {
+			managedCount++
+		}
+		if err := r.reconcileAuthorizationPolicy(ctx, route); err != nil {
+			log.Error(err, "Failed to reconcile AuthorizationPolicy")
+			reconcileErr = err
+		} else {
+			managedCount++
+		}
+	} else {
+		if err := r.deleteAuthResources(ctx, route); err != nil {
+			log.Error(err, "Failed to delete auth resources")
+			reconcileErr = err
 		}
 	}
 
@@ -812,6 +838,100 @@ func sortedMapKeys(m map[string]string) []string {
 	return keys
 }
 
+func (r *RouteReconciler) reconcileRequestAuthentication(ctx context.Context, route *platformv1alpha1.Route) error {
+	if route.Spec.Auth == nil {
+		return nil
+	}
+
+	gwName, gwNs := r.gatewayRef(route)
+	forwardToken := true
+	if route.Spec.Auth.ForwardOriginalToken != nil {
+		forwardToken = *route.Spec.Auth.ForwardOriginalToken
+	}
+
+	ra := &securityv1beta1.RequestAuthentication{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-jwt", route.Name),
+			Namespace: gwNs,
+			Labels:    r.managedLabels(route),
+		},
+	}
+	ra.Spec.Selector = &istiotypev1beta1.WorkloadSelector{MatchLabels: map[string]string{"gateway.networking.k8s.io/gateway-name": gwName}}
+	ra.Spec.JwtRules = []*istiosecv1beta1.JWTRule{{
+		Issuer:               route.Spec.Auth.Issuer,
+		JwksUri:              route.Spec.Auth.JWKSURI,
+		Audiences:            append([]string(nil), route.Spec.Auth.Audiences...),
+		ForwardOriginalToken: forwardToken,
+	}}
+
+	return r.createOrUpdateCrossNS(ctx, route, ra)
+}
+
+func (r *RouteReconciler) reconcileAuthorizationPolicy(ctx context.Context, route *platformv1alpha1.Route) error {
+	if route.Spec.Auth == nil {
+		return nil
+	}
+
+	gwName, gwNs := r.gatewayRef(route)
+	ap := &securityv1beta1.AuthorizationPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-authz", route.Name),
+			Namespace: gwNs,
+			Labels:    r.managedLabels(route),
+		},
+	}
+	ap.Spec.Selector = &istiotypev1beta1.WorkloadSelector{MatchLabels: map[string]string{"gateway.networking.k8s.io/gateway-name": gwName}}
+	ap.Spec.Action = istiosecv1beta1.AuthorizationPolicy_ALLOW
+	ap.Spec.Rules = buildAuthorizationPolicyRules(route.Spec.Rules)
+
+	return r.createOrUpdateCrossNS(ctx, route, ap)
+}
+
+func buildAuthorizationPolicyRules(rules []platformv1alpha1.RouteRule) []*istiosecv1beta1.Rule {
+	out := make([]*istiosecv1beta1.Rule, 0, len(rules))
+	for _, rule := range rules {
+		path := authzPathPattern(rule.Path)
+		out = append(out, &istiosecv1beta1.Rule{
+			From: []*istiosecv1beta1.Rule_From{{
+				Source: &istiosecv1beta1.Source{RequestPrincipals: []string{"*"}},
+			}},
+			To: []*istiosecv1beta1.Rule_To{{
+				Operation: &istiosecv1beta1.Operation{
+					Hosts: []string{rule.Host},
+					Paths: []string{path},
+				},
+			}},
+		})
+	}
+	return out
+}
+
+func authzPathPattern(path string) string {
+	if path == "" || path == "/" {
+		return "/*"
+	}
+	if strings.HasSuffix(path, "*") {
+		return path
+	}
+	if strings.HasSuffix(path, "/") {
+		return path + "*"
+	}
+	return path + "*"
+}
+
+func (r *RouteReconciler) deleteAuthResources(ctx context.Context, route *platformv1alpha1.Route) error {
+	_, gwNs := r.gatewayRef(route)
+	for _, obj := range []client.Object{
+		&securityv1beta1.RequestAuthentication{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("%s-jwt", route.Name), Namespace: gwNs}},
+		&securityv1beta1.AuthorizationPolicy{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("%s-authz", route.Name), Namespace: gwNs}},
+	} {
+		if err := r.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *RouteReconciler) reconcileDestinationRule(ctx context.Context, route *platformv1alpha1.Route, index int, rule platformv1alpha1.RouteRule) error {
 	_, gwNs := r.gatewayRef(route)
 
@@ -942,6 +1062,22 @@ func (r *RouteReconciler) cleanupOwnedResources(ctx context.Context, route *plat
 		}
 	}
 
+	// Clean up RequestAuthentications in gateway namespace
+	raList := &securityv1beta1.RequestAuthenticationList{}
+	if err := r.List(ctx, raList, append(listOpts, client.InNamespace(gwNs))...); err == nil {
+		for i := range raList.Items {
+			_ = r.Delete(ctx, raList.Items[i])
+		}
+	}
+
+	// Clean up AuthorizationPolicies in gateway namespace
+	apList := &securityv1beta1.AuthorizationPolicyList{}
+	if err := r.List(ctx, apList, append(listOpts, client.InNamespace(gwNs))...); err == nil {
+		for i := range apList.Items {
+			_ = r.Delete(ctx, apList.Items[i])
+		}
+	}
+
 	return nil
 }
 
@@ -1003,6 +1139,8 @@ func (r *RouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&platformv1alpha1.Route{}).
 		Owns(&gatewayv1.HTTPRoute{}).
+		Owns(&securityv1beta1.RequestAuthentication{}).
+		Owns(&securityv1beta1.AuthorizationPolicy{}).
 		Named("route").
 		Complete(r)
 }

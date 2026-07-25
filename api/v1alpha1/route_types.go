@@ -128,6 +128,24 @@ type RouteRetries struct {
 	RetryOn string `json:"retryOn,omitempty"`
 }
 
+// RouteAuth defines JWT authn/authz settings for route traffic.
+type RouteAuth struct {
+	// Issuer is the JWT issuer URL or identifier.
+	Issuer string `json:"issuer"`
+
+	// JWKSURI optionally overrides OpenID discovery with explicit JWKS URI.
+	// +optional
+	JWKSURI string `json:"jwksUri,omitempty"`
+
+	// Audiences limits accepted JWT audiences.
+	// +optional
+	Audiences []string `json:"audiences,omitempty"`
+
+	// ForwardOriginalToken keeps the original token in upstream requests.
+	// +optional
+	ForwardOriginalToken *bool `json:"forwardOriginalToken,omitempty"`
+}
+
 // RouteSpec defines the desired state of Route.
 type RouteSpec struct {
 	// Rules is a list of routing rules. Each rule maps a host+path to a backend service.
@@ -158,6 +176,10 @@ type RouteSpec struct {
 	// Retries configures Istio retry policy for all rules.
 	// +optional
 	Retries *RouteRetries `json:"retries,omitempty"`
+
+	// Auth configures Istio RequestAuthentication + AuthorizationPolicy resources.
+	// +optional
+	Auth *RouteAuth `json:"auth,omitempty"`
 }
 
 // RouteConditionType defines the condition types for Route status.
