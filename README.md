@@ -71,9 +71,10 @@ User creates Route CR (namespaced)
 - **Gateway API CRDs** installed (`kubectl get crd gateways.gateway.networking.k8s.io`)
 - **A Gateway resource** deployed (e.g., in `istio-system`) with HTTPS and HTTP listeners
 - **Kubernetes** v1.28+
-- **cert-manager** with a `ClusterIssuer` configured (e.g., Let's Encrypt) for automatic TLS certificate provisioning
+- **cert-manager** (optional, required if using `certManager.enabled=true` in Helm) with a working `ClusterIssuer` — verify with `kubectl get clusterissuer` and ensure all cert-manager pods are Ready (`kubectl get pods -n cert-manager`). For local/dev clusters (Kind, k3d), a `selfSigned` ClusterIssuer works.
 - **external-dns** configured with `--source=gateway-httproute` to automatically create DNS records from HTTPRoute hostnames
 - A wildcard or per-host TLS certificate referenced by the Gateway
+- **Kind/local clusters:** Ensure adequate inotify limits (`fs.inotify.max_user_watches=1048576`, `fs.inotify.max_user_instances=512`) to avoid "too many open files" errors in system pods
 
 ## Limitations
 
@@ -118,7 +119,30 @@ spec:
 - **Controller mode (baseline):** Use the core `Route` workflow for standard routing generation with minimal operational overhead.
 - **Operator mode (advanced):** Use baseline `Route` workflows plus optional advanced features (webhooks, health gates, rollout protections, and policy automation) as needed.
 
-### Install
+### Install with Helm
+
+```bash
+helm install igro ./charts/igro \
+  -n igro-system --create-namespace \
+  --set image.repository=peishu/istio-gateway-api-operator \
+  --set image.tag=v0.2.0
+```
+
+To enable automatic webhook certificate provisioning via cert-manager:
+
+```bash
+helm install igro ./charts/igro \
+  -n igro-system --create-namespace \
+  --set image.repository=peishu/istio-gateway-api-operator \
+  --set image.tag=v0.2.0 \
+  --set certManager.enabled=true \
+  --set certManager.issuerRef.name=letsencrypt \
+  --set certManager.issuerRef.kind=ClusterIssuer
+```
+
+To customize resources, replicas, or disable webhooks, see [`charts/igro/values.yaml`](charts/igro/values.yaml).
+
+### Install with Make (development)
 
 ```bash
 # Install CRD
@@ -239,7 +263,14 @@ make docker-build docker-push IMG=peishu/istio-gateway-api-operator:v0.2.0
 make deploy IMG=peishu/istio-gateway-api-operator:v0.2.0
 ```
 
-### Uninstall
+### Uninstall (Helm)
+
+```bash
+helm uninstall igro -n igro-system
+kubectl delete crd routes.istio-gateway-api-operator.io  # CRDs are not removed by helm uninstall
+```
+
+### Uninstall (Make)
 
 ```bash
 make undeploy
@@ -259,6 +290,11 @@ make uninstall  # Removes CRD
 │   ├── helpers.go                  # Duration parsing, struct builders
 │   ├── route_controller_test.go    # Test skeleton
 │   └── suite_test.go              # Test suite setup
+├── charts/igro/                    # Helm chart
+│   ├── Chart.yaml
+│   ├── values.yaml
+│   ├── crds/                       # CRD installed automatically by Helm
+│   └── templates/                  # Deployment, RBAC, webhooks, etc.
 ├── config/
 │   ├── crd/bases/                  # Generated CRD YAML
 │   ├── rbac/                       # Generated RBAC (ClusterRole, bindings)

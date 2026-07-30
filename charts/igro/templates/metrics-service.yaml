@@ -1,0 +1,17 @@
+{{- if .Values.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "igro.fullname" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igro.labels" . | nindent 4 }}
+spec:
+  ports:
+    - name: https
+      port: {{ .Values.metrics.port }}
+      protocol: TCP
+      targetPort: {{ .Values.metrics.port }}
+  selector:
+    {{- include "igro.selectorLabels" . | nindent 4 }}
+{{- end }}

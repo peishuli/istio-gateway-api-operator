@@ -1,0 +1,16 @@
+{{- if .Values.webhook.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "igro.webhookServiceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igro.labels" . | nindent 4 }}
+spec:
+  ports:
+    - port: 443
+      targetPort: {{ .Values.webhook.port }}
+      protocol: TCP
+  selector:
+    {{- include "igro.selectorLabels" . | nindent 4 }}
+{{- end }}

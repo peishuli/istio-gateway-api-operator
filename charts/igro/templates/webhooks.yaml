@@ -1,0 +1,68 @@
+{{- if .Values.webhook.enabled }}
+{{- $svcName := include "igro.webhookServiceName" . }}
+{{- $ns := .Release.Namespace }}
+{{- $certSecret := include "igro.webhookCertSecret" . }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: {{ include "igro.fullname" . }}-mutating
+  labels:
+    {{- include "igro.labels" . | nindent 4 }}
+  {{- if .Values.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ $ns }}/{{ $certSecret }}
+  {{- end }}
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: {{ $svcName }}
+      namespace: {{ $ns }}
+      path: /mutate-istio-gateway-api-operator-io-v1alpha1-route
+  failurePolicy: Fail
+  name: mroute.kb.io
+  rules:
+  - apiGroups:
+    - istio-gateway-api-operator.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - routes
+  sideEffects: None
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: {{ include "igro.fullname" . }}-validating
+  labels:
+    {{- include "igro.labels" . | nindent 4 }}
+  {{- if .Values.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ $ns }}/{{ $certSecret }}
+  {{- end }}
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: {{ $svcName }}
+      namespace: {{ $ns }}
+      path: /validate-istio-gateway-api-operator-io-v1alpha1-route
+  failurePolicy: Fail
+  name: vroute.kb.io
+  rules:
+  - apiGroups:
+    - istio-gateway-api-operator.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - routes
+  sideEffects: None
+{{- end }}

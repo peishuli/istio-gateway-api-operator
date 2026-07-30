@@ -1,0 +1,14 @@
+apiVersion: v2
+name: igro
+description: Istio Gateway API Route Operator - manages Istio routing resources via a simple Route CRD
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - istio
+  - gateway-api
+  - operator
+  - routing
+home: https://github.com/istio-gateway-operator/route-operator
+sources:
+  - https://github.com/istio-gateway-operator/route-operator

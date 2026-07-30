@@ -1,0 +1,29 @@
+Thank you for installing {{ include "igro.fullname" . }}!
+
+The Istio Gateway API Route Operator is now deployed in namespace: {{ .Release.Namespace }}
+
+To verify the deployment:
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "igro.name" . }}
+
+To create a Route resource:
+  cat <<EOF | kubectl apply -f -
+  apiVersion: istio-gateway-api-operator.io/v1alpha1
+  kind: Route
+  metadata:
+    name: my-route
+  spec:
+    rules:
+      - host: app.example.com
+        path: /
+        backend:
+          serviceName: my-service
+          servicePort: 8080
+  EOF
+
+{{- if and .Values.webhook.enabled (not .Values.certManager.enabled) }}
+
+NOTE: Webhooks are enabled but cert-manager integration is disabled.
+You must manually provision a TLS certificate secret named "{{ include "igro.webhookCertSecret" . }}"
+in namespace "{{ .Release.Namespace }}", or enable cert-manager:
+  helm upgrade {{ .Release.Name }} igro --set certManager.enabled=true
+{{- end }}
