@@ -122,19 +122,17 @@ spec:
 ### Install with Helm
 
 ```bash
-helm install igro ./charts/igro \
-  -n igro-system --create-namespace \
-  --set image.repository=peishu/istio-gateway-api-operator \
-  --set image.tag=v0.2.0
+helm install igro oci://ghcr.io/peishuli/charts/igro \
+  --version 0.1.0 \
+  -n igro-system --create-namespace
 ```
 
 To enable automatic webhook certificate provisioning via cert-manager:
 
 ```bash
-helm install igro ./charts/igro \
+helm install igro oci://ghcr.io/peishuli/charts/igro \
+  --version 0.1.0 \
   -n igro-system --create-namespace \
-  --set image.repository=peishu/istio-gateway-api-operator \
-  --set image.tag=v0.2.0 \
   --set certManager.enabled=true \
   --set certManager.issuerRef.name=letsencrypt \
   --set certManager.issuerRef.kind=ClusterIssuer
