@@ -140,6 +140,27 @@ helm install igro oci://ghcr.io/peishuli/charts/igro \
 
 To customize resources, replicas, or disable webhooks, see [`charts/igro/values.yaml`](charts/igro/values.yaml).
 
+### Upgrade with Helm
+
+```bash
+helm upgrade igro oci://ghcr.io/peishuli/charts/igro \
+  --version 0.2.0 \
+  -n igro-system
+```
+
+### Publishing a New Chart Version
+
+The chart is automatically published to `oci://ghcr.io/peishuli/charts/igro` by GitHub Actions when a version tag is pushed:
+
+```bash
+# 1. Bump version in charts/igro/Chart.yaml
+# 2. Commit and tag
+git add charts/igro/Chart.yaml
+git commit -m "bump chart to 0.2.0"
+git tag v0.2.0
+git push origin main --tags
+```
+
 ### Install with Make (development)
 
 ```bash
